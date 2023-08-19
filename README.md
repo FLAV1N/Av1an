@@ -1,7 +1,7 @@
 # About this fork
 Basically i made av1an support aom-lavish opmox patch, because i added new aom_opmox encoder type you just need to rename the opmox patch to aomenc_opmox.exe, No need to rename it to aomenc anymore.
 
-# About Av1an
+# Av1an
 
 ![av1an fully utilizing a 96-core CPU for video encoding](https://cdn.discordapp.com/attachments/804148977347330048/928879953825640458/av1an_preview.jpg)
 
