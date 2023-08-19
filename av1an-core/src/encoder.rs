@@ -24,6 +24,7 @@ const NULL: &str = if cfg!(windows) { "nul" } else { "/dev/null" };
 )]
 pub enum Encoder {
   aom,
+  aom_opmox,
   rav1e,
   vpx,
   #[strum(serialize = "svt-av1")]
@@ -113,6 +114,12 @@ impl Encoder {
         into_array!["-o", output, "-"],
       )
       .collect(),
+      Self::aom_opmox => chain!(
+        into_array!["aomenc_opmox", "--passes=1"],
+        params,
+        into_array!["-o", output, "-"],
+      )
+      .collect(),
       Self::rav1e => chain!(
         into_array!["rav1e", "-", "-y", "--limit", frame_count.to_string()],
         params,
@@ -160,6 +167,12 @@ impl Encoder {
     match self {
       Self::aom => chain!(
         into_array!["aomenc", "--passes=2", "--pass=1"],
+        params,
+        into_array![format!("--fpf={fpf}.log"), "-o", NULL, "-"],
+      )
+      .collect(),
+      Self::aom_opmox => chain!(
+        into_array!["aomenc_opmox", "--passes=2", "--pass=1"],
         params,
         into_array![format!("--fpf={fpf}.log"), "-o", NULL, "-"],
       )
@@ -252,6 +265,12 @@ impl Encoder {
     match self {
       Self::aom => chain!(
         into_array!["aomenc", "--passes=2", "--pass=2"],
+        params,
+        into_array![format!("--fpf={fpf}.log"), "-o", output, "-"],
+      )
+      .collect(),
+      Self::aom_opmox => chain!(
+        into_array!["aomenc_opmox", "--passes=2", "--pass=2"],
         params,
         into_array![format!("--fpf={fpf}.log"), "-o", output, "-"],
       )
@@ -379,6 +398,27 @@ impl Encoder {
           defaults
         }
       }
+      Encoder::aom_opmox => {
+        let defaults: Vec<String> = into_vec![
+          "--threads=8",
+          "--cpu-used=6",
+          "--end-usage=q",
+          "--cq-level=30",
+        ];
+
+        if cols > 1 || rows > 1 {
+          let columns = ilog2(cols);
+          let rows = ilog2(rows);
+
+          let aom_opmox_tiles: Vec<String> = into_vec![
+            format!("--tile-columns={columns}"),
+            format!("--tile-rows={rows}")
+          ];
+          chain!(defaults, aom_opmox_tiles).collect()
+        } else {
+          defaults
+        }
+      }
       Encoder::rav1e => {
         let defaults: Vec<String> =
           into_vec!["--speed", "6", "--quantizer", "100", "--no-scene-detection"];
@@ -453,7 +493,7 @@ impl Encoder {
   /// Return number of default passes for encoder
   pub const fn get_default_pass(self) -> u8 {
     match self {
-      Self::aom | Self::vpx => 2,
+      Self::aom | Self::vpx | Self::aom_opmox => 2,
       _ => 1,
     }
   }
@@ -461,7 +501,7 @@ impl Encoder {
   /// Default quantizer range target quality mode
   pub const fn get_default_cq_range(self) -> (usize, usize) {
     match self {
-      Self::aom | Self::vpx => (15, 55),
+      Self::aom | Self::vpx | Self::aom_opmox => (15, 55),
       Self::rav1e => (50, 140),
       Self::svt_av1 => (15, 50),
       Self::x264 | Self::x265 => (15, 35),
@@ -472,6 +512,7 @@ impl Encoder {
   pub const fn help_command(self) -> [&'static str; 2] {
     match self {
       Self::aom => ["aomenc", "--help"],
+      Self::aom_opmox => ["aomenc_opmox", "--help"],
       Self::rav1e => ["rav1e", "--fullhelp"],
       Self::vpx => ["vpxenc", "--help"],
       Self::svt_av1 => ["SvtAv1EncApp", "--help"],
@@ -484,6 +525,7 @@ impl Encoder {
   pub const fn bin(self) -> &'static str {
     match self {
       Self::aom => "aomenc",
+      Self::aom_opmox => "aomenc_opmox",
       Self::rav1e => "rav1e",
       Self::vpx => "vpxenc",
       Self::svt_av1 => "SvtAv1EncApp",
@@ -495,7 +537,7 @@ impl Encoder {
   /// Get the name of the video format associated with the encoder
   pub const fn format(self) -> &'static str {
     match self {
-      Self::aom | Self::rav1e | Self::svt_av1 => "av1",
+      Self::aom | Self::rav1e | Self::svt_av1 | Self::aom_opmox => "av1",
       Self::vpx => "vpx",
       Self::x264 => "h264",
       Self::x265 => "h265",
@@ -505,7 +547,7 @@ impl Encoder {
   /// Get the default output extension for the encoder
   pub const fn output_extension(&self) -> &'static str {
     match &self {
-      Self::aom | Self::rav1e | Self::vpx | Self::svt_av1 => "ivf",
+      Self::aom | Self::rav1e | Self::vpx | Self::svt_av1 | Self::aom_opmox => "ivf",
       Self::x264 | Self::x265 => "mkv",
     }
   }
@@ -513,7 +555,7 @@ impl Encoder {
   /// Returns function pointer used for matching Q/CRF arguments in command line
   fn q_match_fn(self) -> fn(&str) -> bool {
     match self {
-      Self::aom | Self::vpx => |p| p.starts_with("--cq-level="),
+      Self::aom | Self::vpx | Self::aom_opmox => |p| p.starts_with("--cq-level="),
       Self::rav1e => |p| p == "--quantizer",
       Self::svt_av1 => |p| matches!(p, "--qp" | "-q" | "--crf"),
       Self::x264 | Self::x265 => |p| p == "--crf",
@@ -522,7 +564,7 @@ impl Encoder {
 
   fn replace_q(self, index: usize, q: usize) -> (usize, String) {
     match self {
-      Self::aom | Self::vpx => (index, format!("--cq-level={q}")),
+      Self::aom | Self::vpx | Self::aom_opmox => (index, format!("--cq-level={q}")),
       Self::rav1e | Self::svt_av1 | Self::x265 | Self::x264 => (index + 1, q.to_string()),
     }
   }
@@ -530,7 +572,7 @@ impl Encoder {
   fn insert_q(self, q: usize) -> ArrayVec<String, 2> {
     let mut output = ArrayVec::new();
     match self {
-      Self::aom | Self::vpx => {
+      Self::aom | Self::vpx | Self::aom_opmox => {
         output.push(format!("--cq-level={q}"));
       }
       Self::rav1e => {
@@ -564,7 +606,7 @@ impl Encoder {
     use crate::parse::*;
 
     match self {
-      Self::aom | Self::vpx => {
+      Self::aom | Self::vpx | Self::aom_opmox => {
         cfg_if! {
           if #[cfg(any(target_arch = "x86", target_arch = "x86_64"))] {
             if is_x86_feature_detected!("sse4.1") && is_x86_feature_detected!("ssse3") {
@@ -590,6 +632,46 @@ impl Encoder {
     match &self {
       Self::aom => inplace_vec![
         "aomenc",
+        "--passes=1",
+        format!("--threads={threads}"),
+        "--tile-columns=2",
+        "--tile-rows=1",
+        "--end-usage=q",
+        "-b",
+        "8",
+        "--cpu-used=6",
+        format!("--cq-level={q}"),
+        "--enable-filter-intra=0",
+        "--enable-smooth-intra=0",
+        "--enable-paeth-intra=0",
+        "--enable-cfl-intra=0",
+        "--enable-obmc=0",
+        "--enable-palette=0",
+        "--enable-overlay=0",
+        "--enable-intrabc=0",
+        "--enable-angle-delta=0",
+        "--reduced-tx-type-set=1",
+        "--enable-dual-filter=0",
+        "--enable-intra-edge-filter=0",
+        "--enable-order-hint=0",
+        "--enable-flip-idtx=0",
+        "--enable-dist-wtd-comp=0",
+        "--enable-interintra-wedge=0",
+        "--enable-onesided-comp=0",
+        "--enable-interintra-comp=0",
+        "--enable-global-motion=0",
+        "--enable-cdef=0",
+        "--max-reference-frames=3",
+        "--cdf-update-mode=2",
+        "--deltaq-mode=0",
+        "--enable-tpl-model=0",
+        "--sb-size=64",
+        "--min-partition-size=32",
+        "--max-partition-size=32",
+        "--kf-min-dist=12",
+      ],
+      Self::aom_opmox => inplace_vec![
+        "aomenc_opmox",
         "--passes=1",
         format!("--threads={threads}"),
         "--tile-columns=2",
@@ -778,6 +860,7 @@ impl Encoder {
   pub fn construct_target_quality_command_probe_slow(self, q: usize) -> Vec<Cow<'static, str>> {
     match &self {
       Self::aom => inplace_vec!["aomenc", "--passes=1", format!("--cq-level={q}")],
+      Self::aom_opmox => inplace_vec!["aomenc_opmox", "--passes=1", format!("--cq-level={q}")],
       Self::rav1e => inplace_vec!["rav1e", "-y", "--quantizer", q.to_string()],
       Self::vpx => inplace_vec![
         "vpxenc",
@@ -875,7 +958,7 @@ impl Encoder {
 
     let output: Vec<Cow<str>> = match self {
       Self::svt_av1 => chain!(params, into_array!["-b", probe_path]).collect(),
-      Self::aom | Self::rav1e | Self::vpx | Self::x264 | Self::x265 => {
+      Self::aom | Self::rav1e | Self::vpx | Self::x264 | Self::x265 | Self::aom_opmox => {
         chain!(params, into_array!["-o", probe_path, "-"]).collect()
       }
     };
@@ -944,6 +1027,12 @@ create_get_format_bit_depth_function!(
 );
 create_get_format_bit_depth_function!(
   aom,
+   8: [YUV420P, YUV422P, YUV444P, GBRP, GRAY8],
+  10: [YUV420P10LE, YUV422P10LE, YUV444P10LE, GBRP10LE, GRAY10LE],
+  12: [YUV420P12LE, YUV422P12LE, YUV444P12LE, GBRP12LE, GRAY12LE,]
+);
+create_get_format_bit_depth_function!(
+  aom_opmox,
    8: [YUV420P, YUV422P, YUV444P, GBRP, GRAY8],
   10: [YUV420P10LE, YUV422P10LE, YUV444P10LE, GBRP10LE, GRAY10LE],
   12: [YUV420P12LE, YUV422P12LE, YUV444P12LE, GBRP12LE, GRAY12LE,]
