@@ -54,6 +54,7 @@ impl Scene {
       map_res(
         alt((
           tag("aom"),
+          tag("aom_opmox"),
           tag("rav1e"),
           tag("x264"),
           tag("x265"),
@@ -136,7 +137,7 @@ impl Scene {
     let mut zone_args = zone_args.1.into_iter().collect::<HashMap<_, _>>();
     if let Some(zone_passes) = zone_args.remove("--passes") {
       passes = zone_passes.unwrap().parse().unwrap();
-    } else if [Encoder::aom, Encoder::vpx].contains(&encoder) && zone_args.contains_key("--rt") {
+    } else if [Encoder::aom, Encoder::vpx, Encoder::aom_opmox].contains(&encoder) && zone_args.contains_key("--rt") {
       passes = 1;
     }
     if let Some(zone_photon_noise) = zone_args.remove("--photon-noise") {
@@ -151,7 +152,7 @@ impl Scene {
     if let Some(zone_min_scene_len) = zone_args.remove("--min-scene-len") {
       min_scene_len = zone_min_scene_len.unwrap().parse().unwrap();
     }
-    let raw_zone_args = if [Encoder::aom, Encoder::vpx].contains(&encoder) {
+    let raw_zone_args = if [Encoder::aom, Encoder::vpx, Encoder::aom_opmox].contains(&encoder) {
       zone_args
         .into_iter()
         .map(|(key, value)| value.map_or_else(|| key.to_string(), |value| format!("{key}={value}")))
@@ -178,7 +179,7 @@ impl Scene {
       let interleaved_args: Vec<&str> = raw_zone_args
         .iter()
         .filter_map(|param| {
-          if param.starts_with('-') && [Encoder::aom, Encoder::vpx].contains(&encoder) {
+          if param.starts_with('-') && [Encoder::aom, Encoder::vpx, Encoder::aom_opmox].contains(&encoder) {
             // These encoders require args to be passed using an equal sign,
             // e.g. `--cq-level=30`
             param.split('=').next()
@@ -215,7 +216,7 @@ impl Scene {
         {
           video_params.remove(pos);
           if let Some(next) = video_params.get(pos) {
-            if !([Encoder::aom, Encoder::vpx].contains(&encoder)
+            if !([Encoder::aom, Encoder::vpx, Encoder::aom_opmox].contains(&encoder)
               || next.starts_with("--")
               || (next.starts_with('-') && next.chars().nth(1).map_or(false, char::is_alphabetic)))
             {
