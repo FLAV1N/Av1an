@@ -976,7 +976,7 @@ impl Encoder {
         }
       };
     }
-    impl_this_function!(x264, x265, vpx, aom, rav1e, svt_av1)
+    impl_this_function!(x264, x265, vpx, aom, aom_opmox, rav1e, svt_av1)
   }
 }
 
