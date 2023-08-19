@@ -334,7 +334,7 @@ mod tests {
       };
     }
 
-    generate_tests!(aom, rav1e, svt_av1, vpx, x264, x265);
+    generate_tests!(aom, aom_opmox, rav1e, svt_av1, vpx, x264, x265);
   }
 
   #[test]
