@@ -82,7 +82,7 @@ impl EncodeArgs {
     if self.concat == ConcatMethod::Ivf
       && !matches!(
         self.encoder,
-        Encoder::rav1e | Encoder::aom | Encoder::svt_av1 | Encoder::vpx
+        Encoder::rav1e | Encoder::aom | Encoder::svt_av1 | Encoder::vpx | Encoder::aom_opmox
       )
     {
       bail!(".ivf only supports VP8, VP9, and AV1");
@@ -167,7 +167,7 @@ properly into a mkv file. Specify mkvmerge as the concatenation method by settin
       if strength > 64 {
         bail!("Valid strength values for photon noise are 0-64");
       }
-      if ![Encoder::aom, Encoder::rav1e].contains(&self.encoder) {
+      if ![Encoder::aom, Encoder::rav1e, Encoder::aom_opmox].contains(&self.encoder) {
         bail!("Photon noise synth is only supported with aomenc and rav1e");
       }
     }
@@ -184,7 +184,19 @@ properly into a mkv file. Specify mkvmerge as the concatenation method by settin
       );
     }
 
-    if matches!(self.encoder, Encoder::aom | Encoder::vpx)
+    if self.encoder == Encoder::aom_opmox
+      && self.concat != ConcatMethod::MKVMerge
+      && self
+        .video_params
+        .iter()
+        .any(|param| param == "--enable-keyframe-filtering=2")
+    {
+      bail!(
+        "keyframe filtering mode 2 currently only works when using mkvmerge as the concat method"
+      );
+    }
+
+    if matches!(self.encoder, Encoder::aom | Encoder::vpx | Encoder::aom_opmox)
       && self.passes != 1
       && self.video_params.iter().any(|param| param == "--rt")
     {
@@ -205,7 +217,7 @@ properly into a mkv file. Specify mkvmerge as the concatenation method by settin
       .video_params
       .iter()
       .filter_map(|param| {
-        if param.starts_with('-') && [Encoder::aom, Encoder::vpx].contains(&self.encoder) {
+        if param.starts_with('-') && [Encoder::aom, Encoder::vpx, Encoder::aom_opmox].contains(&self.encoder) {
           // These encoders require args to be passed using an equal sign,
           // e.g. `--cq-level=30`
           param.split('=').next()
@@ -328,6 +340,10 @@ pub(crate) fn insert_noise_table_params(
 ) {
   match encoder {
     Encoder::aom => {
+      video_params.retain(|param| !param.starts_with("--denoise-noise-level="));
+      video_params.push(format!("--film-grain-table={}", table.to_str().unwrap()));
+    }
+    Encoder::aom_opmox => {
       video_params.retain(|param| !param.starts_with("--denoise-noise-level="));
       video_params.push(format!("--film-grain-table={}", table.to_str().unwrap()));
     }
