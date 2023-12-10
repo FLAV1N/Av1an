@@ -360,8 +360,8 @@ pub(crate) fn insert_noise_table_params(
       video_params.push(format!("--film-grain-table={}", table.to_str().unwrap()));
     }
     Encoder::svt_av1 => {
-      video_params.retain(|param| !param.starts_with("--film-grain-denoise="));
-      video_params.push(format!("--fgs-table={}", table.to_str().unwrap()));
+      video_params.retain(|param| !param.starts_with("--film-grain-denoise"));
+      video_params.push(format!("--fgs-table {}", table.to_str().unwrap()));
     }
     Encoder::rav1e => {
       let photon_noise_idx = video_params
