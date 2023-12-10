@@ -465,7 +465,7 @@ pub struct CliOpts {
   /// - `-x`/`--extra-split`
   /// - `--min-scene-len`
   /// - `--passes`
-  /// - `--photon-noise` (aomenc/rav1e only)
+  /// - `--photon-noise` (aomenc, rav1e, and patched svt-av1 with fgs only)
   #[clap(long, help_heading = "Encoding", verbatim_doc_comment)]
   pub zones: Option<PathBuf>,
 
