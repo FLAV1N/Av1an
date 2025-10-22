@@ -15,6 +15,7 @@ For more details, see documentation for each parameter or run `av1an --help`.
 Name | Flag | Type | Default
 --- | --- | --- | ---
 [Input](./Cli/general.md#input--i) | `-i` | Path
+[Proxy](./Cli/general.md#proxy---proxy) | `--proxy` | Path
 [Output](./Cli/general.md#output--o) | `-o` | Path
 [Temporary](./Cli/general.md#temporary---temp) | `--temp` | Path | Input file name hash
 [Quiet](./Cli/general.md#quiet--q---quiet) | `-q` | 
@@ -54,7 +55,7 @@ Name | Flag | Type | Default
 
 Name | Flag | Type | Default
 --- | --- | --- | ---
-[Encoder](./Cli/encoding.md#encoder--e---encoder) | `-e`, `--encoder` | `ENCODER` | `aom`
+[Encoder](./Cli/encoding.md#encoder--e---encoder) | `-e`, `--encoder` | `ENCODER` | `svt-av1`
 [Video Parameters](./Cli/encoding.md#video-parameters--v---video-params) | `-v`, `--video-params` | String List | Based on Encoder
 [Passes](./Cli/encoding.md#passes--p---passes) | `-p`, `--passes` | Integer | 1
 [Tile Auto](./Cli/encoding.md#tile-auto---tile-auto) | `--tile-auto` || 

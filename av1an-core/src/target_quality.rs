@@ -1,142 +1,203 @@
 use std::{
+    borrow::Cow,
     cmp::{self, Ordering},
     collections::HashSet,
+    io::Read,
     path::{Path, PathBuf},
-    thread::available_parallelism,
+    process::{Child, Stdio},
+    str::FromStr,
+    thread::{self, available_parallelism},
 };
 
-use clap::ValueEnum;
-use ffmpeg::format::Pixel;
+use anyhow::{anyhow, bail};
 use serde::{Deserialize, Serialize};
-use splines::{Interpolation, Key, Spline};
 use tracing::{debug, trace};
 
 use crate::{
     broker::EncoderCrash,
     chunk::Chunk,
+    ffmpeg::FFPixelFormat,
+    interpol::{
+        akima_interpolate,
+        catmull_rom_interpolate,
+        cubic_polynomial_interpolate,
+        linear_interpolate,
+        natural_cubic_spline,
+        pchip_interpolate,
+        quadratic_interpolate,
+    },
     metrics::{
         butteraugli::ButteraugliSubMetric,
         statistics::MetricStatistics,
-        vmaf::{read_vmaf_file, run_vmaf, run_vmaf_weighted},
+        vmaf::{get_vmaf_model_version, read_vmaf_file, run_vmaf, run_vmaf_weighted},
         xpsnr::{read_xpsnr_file, run_xpsnr, XPSNRSubMetric},
     },
     progress_bar::update_mp_msg,
-    vapoursynth::{measure_butteraugli, measure_ssimulacra2, measure_xpsnr},
+    vapoursynth::{measure_butteraugli, measure_ssimulacra2, measure_xpsnr, VapoursynthPlugins},
     Encoder,
-    ProbingSpeed,
     ProbingStatistic,
     ProbingStatisticName,
     TargetMetric,
+    VmafFeature,
 };
 
-const SCORE_TOLERANCE: f64 = 0.01;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InterpolationMethod {
+    Linear,
+    Quadratic,
+    Natural,
+    Pchip,
+    Catmull,
+    Akima,
+    CubicPolynomial,
+}
+
+impl FromStr for InterpolationMethod {
+    type Err = ();
+
+    #[inline]
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "linear" => Ok(Self::Linear),
+            "quadratic" => Ok(Self::Quadratic),
+            "natural" => Ok(Self::Natural),
+            "pchip" => Ok(Self::Pchip),
+            "catmull" => Ok(Self::Catmull),
+            "akima" => Ok(Self::Akima),
+            "cubicpolynomial" | "cubic" => Ok(Self::CubicPolynomial),
+            _ => Err(()),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TargetQuality {
     pub vmaf_res:              String,
-    pub probe_res:             Option<String>,
+    pub probe_res:             Option<(u32, u32)>,
     pub vmaf_scaler:           String,
     pub vmaf_filter:           Option<String>,
     pub vmaf_threads:          usize,
     pub model:                 Option<PathBuf>,
     pub probing_rate:          usize,
-    pub probing_speed:         Option<ProbingSpeed>,
     pub probes:                u32,
-    pub target:                f64,
+    pub target:                Option<(f64, f64)>,
     pub metric:                TargetMetric,
     pub min_q:                 u32,
     pub max_q:                 u32,
+    pub interp_method:         Option<(InterpolationMethod, InterpolationMethod)>,
     pub encoder:               Encoder,
-    pub pix_format:            Pixel,
+    pub pix_format:            FFPixelFormat,
     pub temp:                  String,
     pub workers:               usize,
-    pub video_params:          Vec<String>,
+    pub video_params:          Option<Vec<String>>,
+    pub params_copied:         bool,
     pub vspipe_args:           Vec<String>,
-    pub probe_slow:            bool,
     pub probing_vmaf_features: Vec<VmafFeature>,
     pub probing_statistic:     ProbingStatistic,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ValueEnum)]
-pub enum VmafFeature {
-    #[value(name = "default")]
-    Default,
-    #[value(name = "weighted")]
-    Weighted,
-    #[value(name = "neg")]
-    Neg,
-    #[value(name = "motionless")]
-    Motionless,
-    #[value(name = "uhd")]
-    Uhd,
-}
-
 impl TargetQuality {
-    fn per_shot_target_quality(
+    #[inline]
+    pub fn default(temp_dir: &str, encoder: Encoder) -> Self {
+        Self {
+            vmaf_res: "1920x1080".to_string(),
+            probe_res: Some((1920, 1080)),
+            vmaf_scaler: "bicubic".to_string(),
+            vmaf_filter: None,
+            vmaf_threads: available_parallelism()
+                .expect("Unrecoverable: Failed to get thread count")
+                .get(),
+            model: None,
+            probing_rate: 1,
+            probes: 4,
+            target: None,
+            metric: TargetMetric::VMAF,
+            min_q: encoder.get_default_cq_range().0 as u32,
+            max_q: encoder.get_default_cq_range().1 as u32,
+            interp_method: None,
+            encoder,
+            pix_format: FFPixelFormat::YUV420P10LE,
+            temp: temp_dir.to_owned(),
+            workers: 1,
+            video_params: None,
+            params_copied: false,
+            vspipe_args: vec![],
+            probing_vmaf_features: vec![VmafFeature::Default],
+            probing_statistic: ProbingStatistic {
+                name:  ProbingStatisticName::Automatic,
+                value: None,
+            },
+        }
+    }
+
+    #[inline]
+    pub fn per_shot_target_quality(
         &self,
         chunk: &Chunk,
         worker_id: Option<usize>,
-    ) -> anyhow::Result<u32> {
+        plugins: Option<VapoursynthPlugins>,
+    ) -> anyhow::Result<f32> {
+        anyhow::ensure!(self.target.is_some(), "Target must be some");
+        let target = self.target.expect("target is some");
         // History of probe results as quantizer-score pairs
-        let mut quantizer_score_history: Vec<(u32, f64)> = vec![];
+        let mut quantizer_score_history: Vec<(f32, f64)> = vec![];
 
-        let update_progress_bar = |next_quantizer: u32| {
+        let update_progress_bar = |next_quantizer: f32| {
             if let Some(worker_id) = worker_id {
                 update_mp_msg(
                     worker_id,
                     format!(
-                        "Targeting {metric} Quality {target} - Testing {quantizer}",
+                        "Targeting {metric} Quality {min}-{max} - Testing {quantizer}",
                         metric = self.metric,
-                        target = self.target,
+                        min = target.0,
+                        max = target.1,
                         quantizer = next_quantizer
                     ),
                 );
             }
         };
 
-        // Initialize quantizer limits from specified minimum and maximum quantizers
-        let mut lower_quantizer_limit = self.min_q;
-        let mut upper_quantizer_limit = self.max_q;
+        // Initialize quantizer limits from specified range or encoder defaults
+        let step = match self.encoder {
+            Encoder::x264 | Encoder::x265 => 0.25,
+            Encoder::svt_av1 if crate::encoder::svt_av1_supports_quarter_steps(&self.temp) => 0.25,
+            _ => 1.0,
+        };
+        let mut lower_quantizer_limit = self.min_q as f32;
+        let mut upper_quantizer_limit = self.max_q as f32;
+
+        let skip_reason;
 
         loop {
             let next_quantizer = predict_quantizer(
                 lower_quantizer_limit,
                 upper_quantizer_limit,
                 &quantizer_score_history,
+                // Invert for butteraugli
                 match self.metric {
-                    // For inverse metrics, target must be inverted for ascending comparisons
-                    TargetMetric::ButteraugliINF | TargetMetric::Butteraugli3 => -self.target,
-                    _ => self.target,
+                    TargetMetric::ButteraugliINF | TargetMetric::Butteraugli3 => {
+                        let (min, max) = target;
+                        (-max, -min)
+                    },
+                    _ => target,
                 },
-            );
+                self.interp_method,
+                step,
+            )?;
 
-            if let Some((quantizer, score)) = quantizer_score_history
+            if quantizer_score_history
                 .iter()
-                .find(|(quantizer, _)| *quantizer == next_quantizer)
+                .any(|(quantizer, _)| *quantizer == next_quantizer)
             {
                 // Predicted quantizer has already been probed
-                log_probes(
-                    &quantizer_score_history,
-                    self.metric,
-                    self.target,
-                    chunk.frames() as u32,
-                    self.probing_rate as u32,
-                    self.probing_speed,
-                    &chunk.name(),
-                    *quantizer,
-                    match self.metric {
-                        TargetMetric::ButteraugliINF | TargetMetric::Butteraugli3 => -score,
-                        _ => *score,
-                    },
-                    SkipProbingReason::None,
-                );
+                skip_reason = SkipProbingReason::None;
                 break;
             }
 
             update_progress_bar(next_quantizer);
 
             let score = {
-                let value = self.probe(chunk, next_quantizer as usize)?;
+                let value = self.probe(chunk, next_quantizer, plugins)?;
 
                 // Butteraugli is an inverse metric, invert score for comparisons
                 match self.metric {
@@ -144,125 +205,121 @@ impl TargetQuality {
                     _ => value,
                 }
             };
-            let score_within_tolerance = within_tolerance(
+            let score_within_range = within_range(
                 match self.metric {
                     TargetMetric::ButteraugliINF | TargetMetric::Butteraugli3 => -score,
                     _ => score,
                 },
-                self.target,
+                target,
             );
 
             quantizer_score_history.push((next_quantizer, score));
 
-            if score_within_tolerance || quantizer_score_history.len() >= self.probes as usize {
-                log_probes(
-                    &quantizer_score_history,
-                    self.metric,
-                    self.target,
-                    chunk.frames() as u32,
-                    self.probing_rate as u32,
-                    self.probing_speed,
-                    &chunk.name(),
-                    next_quantizer,
-                    match self.metric {
-                        TargetMetric::ButteraugliINF | TargetMetric::Butteraugli3 => -score,
-                        _ => score,
-                    },
-                    if score_within_tolerance {
-                        SkipProbingReason::WithinTolerance
-                    } else {
-                        SkipProbingReason::ProbeLimitReached
-                    },
-                );
+            if score_within_range || quantizer_score_history.len() >= self.probes as usize {
+                skip_reason = if score_within_range {
+                    SkipProbingReason::WithinTolerance
+                } else {
+                    SkipProbingReason::ProbeLimitReached
+                };
                 break;
             }
 
-            if score
-                > (match self.metric {
-                    TargetMetric::ButteraugliINF | TargetMetric::Butteraugli3 => -self.target,
-                    _ => self.target,
-                })
-            {
-                lower_quantizer_limit = (next_quantizer + 1).min(upper_quantizer_limit);
-            } else {
-                upper_quantizer_limit = (next_quantizer - 1).max(lower_quantizer_limit);
+            let target_range = match self.metric {
+                TargetMetric::ButteraugliINF | TargetMetric::Butteraugli3 => (-target.1, -target.0),
+                _ => target,
+            };
+
+            if score > target_range.1 {
+                lower_quantizer_limit = ((next_quantizer) + step).min(upper_quantizer_limit);
+            } else if score < target_range.0 {
+                upper_quantizer_limit = ((next_quantizer) - step).max(lower_quantizer_limit);
             }
 
             // Ensure quantizer limits are valid
             if lower_quantizer_limit > upper_quantizer_limit {
-                log_probes(
-                    &quantizer_score_history,
-                    self.metric,
-                    self.target,
-                    chunk.frames() as u32,
-                    self.probing_rate as u32,
-                    self.probing_speed,
-                    &chunk.name(),
-                    next_quantizer,
-                    match self.metric {
-                        TargetMetric::ButteraugliINF | TargetMetric::Butteraugli3 => -score,
-                        _ => score,
-                    },
-                    if score
-                        > (match self.metric {
-                            TargetMetric::ButteraugliINF | TargetMetric::Butteraugli3 => {
-                                -self.target
-                            },
-                            _ => self.target,
-                        })
-                    {
-                        SkipProbingReason::QuantizerTooHigh
-                    } else {
-                        SkipProbingReason::QuantizerTooLow
-                    },
-                );
+                skip_reason = if score > target_range.1 {
+                    SkipProbingReason::QuantizerTooHigh
+                } else {
+                    SkipProbingReason::QuantizerTooLow
+                };
                 break;
             }
         }
 
-        let final_quantizer_score = if let Some(highest_quantizer_score_within_tolerance) =
-            quantizer_score_history
-                .iter()
-                .filter(|(_, score)| {
-                    within_tolerance(
-                        match self.metric {
-                            TargetMetric::ButteraugliINF | TargetMetric::Butteraugli3 => -score,
-                            _ => *score,
-                        },
-                        self.target,
-                    )
-                })
-                .max_by_key(|(quantizer, _)| *quantizer)
-        {
-            // Multiple probes within tolerance, choose the highest
-            highest_quantizer_score_within_tolerance
-        } else {
-            // No quantizers within tolerance, choose the quantizer closest to target
-            quantizer_score_history
-                .iter()
-                .min_by(|(_, score1), (_, score2)| {
-                    let score_1 = match self.metric {
-                        TargetMetric::ButteraugliINF | TargetMetric::Butteraugli3 => -score1,
-                        _ => *score1,
-                    };
-                    let score_2 = match self.metric {
-                        TargetMetric::ButteraugliINF | TargetMetric::Butteraugli3 => -score2,
-                        _ => *score2,
-                    };
-                    let difference1 = (score_1 - self.target).abs();
-                    let difference2 = (score_2 - self.target).abs();
-                    difference1.partial_cmp(&difference2).unwrap_or(Ordering::Equal)
-                })
-                .unwrap()
-        };
+        // Calculate final quantizer and score BEFORE logging
+        let final_quantizer_score = quantizer_score_history
+            .iter()
+            .filter(|(_, score)| {
+                within_range(
+                    match self.metric {
+                        TargetMetric::ButteraugliINF | TargetMetric::Butteraugli3 => -score,
+                        _ => *score,
+                    },
+                    target,
+                )
+            })
+            .max_by(|(q1, _), (q2, _)| q1.partial_cmp(q2).unwrap_or(std::cmp::Ordering::Equal))
+            .map_or_else(
+                || {
+                    // No quantizers within tolerance, choose the quantizer closest to target
+                    let target_midpoint = f64::midpoint(target.0, target.1);
+                    quantizer_score_history
+                        .iter()
+                        .min_by(|(_, score1), (_, score2)| {
+                            let score_1 = match self.metric {
+                                TargetMetric::ButteraugliINF | TargetMetric::Butteraugli3 => {
+                                    -score1
+                                },
+                                _ => *score1,
+                            };
+                            let score_2 = match self.metric {
+                                TargetMetric::ButteraugliINF | TargetMetric::Butteraugli3 => {
+                                    -score2
+                                },
+                                _ => *score2,
+                            };
+                            let difference1 = (score_1 - target_midpoint).abs();
+                            let difference2 = (score_2 - target_midpoint).abs();
+                            difference1.partial_cmp(&difference2).unwrap_or(Ordering::Equal)
+                        })
+                        .expect("quantizer_score_history is not empty")
+                },
+                |highest_quantizer_score_within_range| highest_quantizer_score_within_range,
+            );
 
-        // Note: if the score is to be returned in the future, ensure to invert it back
-        // if metric is inverse (eg. Butteraugli)
+        log_probes(
+            &quantizer_score_history,
+            self.metric,
+            target,
+            chunk.frames() as u32,
+            self.probing_rate as u32,
+            self.video_params.as_ref(),
+            &chunk.name(),
+            final_quantizer_score.0,
+            // Inverse reverse metrics
+            match self.metric {
+                TargetMetric::ButteraugliINF | TargetMetric::Butteraugli3 => {
+                    -final_quantizer_score.1
+                },
+                _ => final_quantizer_score.1,
+            },
+            skip_reason,
+        );
+
         Ok(final_quantizer_score.0)
     }
 
-    fn probe(&self, chunk: &Chunk, quantizer: usize) -> anyhow::Result<f64> {
+    fn probe(
+        &self,
+        chunk: &Chunk,
+        quantizer: f32,
+        plugins: Option<VapoursynthPlugins>,
+    ) -> anyhow::Result<f64> {
         let probe_name = self.encode_probe(chunk, quantizer)?;
+        let reference_pipe_cmd =
+            chunk.proxy_cmd.as_ref().map_or(chunk.source_cmd.as_slice(), |proxy_cmd| {
+                proxy_cmd.as_slice()
+            });
 
         let aggregate_frame_scores = |scores: Vec<f64>| -> anyhow::Result<f64> {
             let mut statistics = MetricStatistics::new(scores);
@@ -280,29 +337,14 @@ impl TargetQuality {
                         statistic.clamp(statistics.minimum(), statistics.maximum())
                     };
 
-                    // Based on probing speed and quantizer
-                    // Probing slower leads to more accurate scores (lower variance)
-                    // Lower quantizer leads to more accurate scores (lower variance) (needs
-                    // testing)
-                    match self.probing_speed.unwrap_or(ProbingSpeed::VeryFast) {
-                        ProbingSpeed::VerySlow | ProbingSpeed::Slow => {
-                            if self.encoder.get_cq_relative_percentage(quantizer) < 0.75 {
-                                // Conservative: Use outliers to determine aggregate
-                                statistics.percentile(1)
-                            } else {
-                                // Less conservative: Use -1 sigma to determine aggregate
-                                sigma_1
-                            }
-                        },
-                        _ => {
-                            if self.encoder.get_cq_relative_percentage(quantizer) > 0.25 {
-                                // Liberal: Use mean to determine aggregate
-                                statistics.mean()
-                            } else {
-                                // Less liberal: Use -1 sigma to determine aggregate
-                                sigma_1
-                            }
-                        },
+                    // Based on quantizer - lower quantizer leads to more accurate scores (lower
+                    // variance) (citation needed)
+                    if self.encoder.get_cq_relative_percentage(quantizer as usize) > 0.25 {
+                        // Liberal: Use mean to determine aggregate
+                        statistics.mean()
+                    } else {
+                        // Less liberal: Use -1 sigma to determine aggregate
+                        sigma_1
                     }
                 },
                 ProbingStatisticName::Mean => statistics.mean(),
@@ -313,13 +355,13 @@ impl TargetQuality {
                     let value = self
                         .probing_statistic
                         .value
-                        .ok_or(anyhow::anyhow!("Percentile statistic requires a value"))?;
+                        .ok_or_else(|| anyhow::anyhow!("Percentile statistic requires a value"))?;
                     statistics.percentile(value as usize)
                 },
                 ProbingStatisticName::StandardDeviation => {
-                    let value = self.probing_statistic.value.ok_or(anyhow::anyhow!(
-                        "Standard deviation statistic requires a value"
-                    ))?;
+                    let value = self.probing_statistic.value.ok_or_else(|| {
+                        anyhow::anyhow!("Standard deviation statistic requires a value")
+                    })?;
                     let sigma_distance = value * statistics.standard_deviation();
                     let statistic = statistics.mean() + sigma_distance;
                     statistic.clamp(statistics.minimum(), statistics.maximum())
@@ -336,16 +378,22 @@ impl TargetQuality {
             TargetMetric::VMAF => {
                 let features: HashSet<_> = self.probing_vmaf_features.iter().copied().collect();
                 let use_weighted = features.contains(&VmafFeature::Weighted);
-                let use_neg = features.contains(&VmafFeature::Neg);
-                let use_uhd = features.contains(&VmafFeature::Uhd);
                 let disable_motion = features.contains(&VmafFeature::Motionless);
 
-                let default_model = match (use_uhd, use_neg) {
-                    (true, true) => Some(PathBuf::from("vmaf_4k_v0.6.1neg.json")),
-                    (true, false) => Some(PathBuf::from("vmaf_4k_v0.6.1.json")),
-                    (false, true) => Some(PathBuf::from("vmaf_v0.6.1neg.json")),
-                    (false, false) => None,
-                };
+                // TODO: Update when nightly changes come to stable (2025-07-15)
+                //   let model = if self.model.is_some() {
+                //     self.model.as_ref()
+                // } else {
+                //     some(&pathbuf::from(format!(
+                //         "{}.json",
+                //         get_vmaf_model_version(&self.probing_vmaf_features)
+                //     )))
+                // };
+
+                let default_model = Some(PathBuf::from(format!(
+                    "{}.json",
+                    get_vmaf_model_version(&self.probing_vmaf_features)
+                )));
 
                 let model = if self.model.is_none() {
                     default_model.as_ref()
@@ -356,16 +404,13 @@ impl TargetQuality {
                 let vmaf_scores = if use_weighted {
                     run_vmaf_weighted(
                         &probe_name,
-                        chunk.source_cmd.as_slice(),
+                        reference_pipe_cmd,
                         self.vspipe_args.clone(),
                         model,
-                        self.probe_res.as_ref().unwrap_or(&self.vmaf_res),
-                        &self.vmaf_scaler,
-                        self.probing_rate,
-                        self.vmaf_filter.as_deref(),
                         self.vmaf_threads,
                         chunk.frame_rate,
                         disable_motion,
+                        &self.probing_vmaf_features,
                     )
                     .map_err(|e| {
                         Box::new(EncoderCrash {
@@ -383,17 +428,21 @@ impl TargetQuality {
 
                     run_vmaf(
                         &probe_name,
-                        chunk.source_cmd.as_slice(),
+                        reference_pipe_cmd,
                         self.vspipe_args.clone(),
                         &fl_path,
                         model,
-                        self.probe_res.as_ref().unwrap_or(&self.vmaf_res),
+                        &self.probe_res.map_or_else(
+                            || self.vmaf_res.clone(),
+                            |(width, height)| format!("{width}x{height}"),
+                        ),
                         &self.vmaf_scaler,
                         self.probing_rate,
                         self.vmaf_filter.as_deref(),
                         self.vmaf_threads,
                         chunk.frame_rate,
                         disable_motion,
+                        &self.probing_vmaf_features,
                     )?;
 
                     read_vmaf_file(&fl_path)?
@@ -402,29 +451,39 @@ impl TargetQuality {
                 aggregate_frame_scores(vmaf_scores)
             },
             TargetMetric::SSIMULACRA2 => {
-                let scores = measure_ssimulacra2(
-                    &chunk.input,
-                    &probe_name,
-                    (chunk.start_frame as u32, chunk.end_frame as u32),
-                    self.probe_res.as_ref(),
-                    self.probing_rate,
-                )?;
+                let scores = if let Some(plugins) = plugins {
+                    measure_ssimulacra2(
+                        chunk.proxy.as_ref().unwrap_or(&chunk.input),
+                        &probe_name,
+                        (chunk.start_frame as u32, chunk.end_frame as u32),
+                        self.probe_res,
+                        self.probing_rate,
+                        plugins,
+                    )?
+                } else {
+                    bail!("SSIMULACRA2 requires Vapoursynth to be installed");
+                };
 
                 aggregate_frame_scores(scores)
             },
             TargetMetric::ButteraugliINF | TargetMetric::Butteraugli3 => {
-                let scores = measure_butteraugli(
-                    match self.metric {
-                        TargetMetric::ButteraugliINF => ButteraugliSubMetric::InfiniteNorm,
-                        TargetMetric::Butteraugli3 => ButteraugliSubMetric::ThreeNorm,
-                        _ => unreachable!(),
-                    },
-                    &chunk.input,
-                    &probe_name,
-                    (chunk.start_frame as u32, chunk.end_frame as u32),
-                    self.probe_res.as_ref(),
-                    self.probing_rate,
-                )?;
+                let scores = if let Some(plugins) = plugins {
+                    measure_butteraugli(
+                        match self.metric {
+                            TargetMetric::ButteraugliINF => ButteraugliSubMetric::InfiniteNorm,
+                            TargetMetric::Butteraugli3 => ButteraugliSubMetric::ThreeNorm,
+                            _ => unreachable!(),
+                        },
+                        chunk.proxy.as_ref().unwrap_or(&chunk.input),
+                        &probe_name,
+                        (chunk.start_frame as u32, chunk.end_frame as u32),
+                        self.probe_res,
+                        self.probing_rate,
+                        plugins,
+                    )?
+                } else {
+                    bail!("Butteraugli requires Vapoursynth to be installed");
+                };
 
                 aggregate_frame_scores(scores)
             },
@@ -435,14 +494,19 @@ impl TargetQuality {
                     XPSNRSubMetric::Weighted
                 };
                 if self.probing_rate > 1 {
-                    let scores = measure_xpsnr(
-                        submetric,
-                        &chunk.input,
-                        &probe_name,
-                        (chunk.start_frame as u32, chunk.end_frame as u32),
-                        self.probe_res.as_ref(),
-                        self.probing_rate,
-                    )?;
+                    let scores = if let Some(plugins) = plugins {
+                        measure_xpsnr(
+                            submetric,
+                            chunk.proxy.as_ref().unwrap_or(&chunk.input),
+                            &probe_name,
+                            (chunk.start_frame as u32, chunk.end_frame as u32),
+                            self.probe_res,
+                            self.probing_rate,
+                            plugins,
+                        )?
+                    } else {
+                        bail!("XPSNR with probing_rate > 1 requires Vapoursynth to be installed");
+                    };
 
                     aggregate_frame_scores(scores)
                 } else {
@@ -451,16 +515,19 @@ impl TargetQuality {
 
                     run_xpsnr(
                         &probe_name,
-                        chunk.source_cmd.as_slice(),
+                        reference_pipe_cmd,
                         self.vspipe_args.clone(),
                         &fl_path,
-                        self.probe_res.as_ref().unwrap_or(&self.vmaf_res),
+                        &self.probe_res.map_or_else(
+                            || self.vmaf_res.clone(),
+                            |(width, height)| format!("{width}x{height}"),
+                        ),
                         &self.vmaf_scaler,
                         self.probing_rate,
                         chunk.frame_rate,
                     )?;
 
-                    let (aggregate, scores) = read_xpsnr_file(fl_path, submetric);
+                    let (aggregate, scores) = read_xpsnr_file(fl_path, submetric)?;
 
                     match self.probing_statistic.name {
                         ProbingStatisticName::Automatic => Ok(aggregate),
@@ -471,7 +538,7 @@ impl TargetQuality {
         }
     }
 
-    fn encode_probe(&self, chunk: &Chunk, q: usize) -> Result<PathBuf, Box<EncoderCrash>> {
+    fn encode_probe(&self, chunk: &Chunk, q: f32) -> Result<PathBuf, Box<EncoderCrash>> {
         let vmaf_threads = if self.vmaf_threads == 0 {
             vmaf_auto_threads(self.workers)
         } else {
@@ -484,38 +551,40 @@ impl TargetQuality {
             q,
             self.pix_format,
             self.probing_rate,
-            self.probing_speed,
             vmaf_threads,
             self.video_params.clone(),
-            self.probe_slow,
         );
 
-        let future = async {
-            let source_cmd = chunk.source_cmd.clone();
-            let cmd = cmd.clone();
+        let source_cmd = chunk
+            .proxy_cmd
+            .clone()
+            .map_or_else(|| chunk.source_cmd.clone(), |proxy_cmd| proxy_cmd);
+        let (ff_cmd, output) = cmd.clone();
 
-            tokio::task::spawn_blocking(move || {
-                let mut source = if let [pipe_cmd, args @ ..] = &*source_cmd {
-                    std::process::Command::new(pipe_cmd)
-                        .args(args)
-                        .stderr(std::process::Stdio::piped())
-                        .stdout(std::process::Stdio::piped())
-                        .spawn()
-                        .map_err(|e| EncoderCrash {
-                            exit_status:        std::process::ExitStatus::default(),
-                            source_pipe_stderr: format!("Failed to spawn source: {e}").into(),
-                            ffmpeg_pipe_stderr: None,
-                            stderr:             String::new().into(),
-                            stdout:             String::new().into(),
-                        })?
-                } else {
-                    unreachable!()
-                };
+        thread::scope(move |scope| {
+            let mut source = if let [pipe_cmd, args @ ..] = &*source_cmd {
+                std::process::Command::new(pipe_cmd)
+                    .args(args)
+                    .stderr(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .spawn()
+                    .map_err(|e| EncoderCrash {
+                        exit_status:        std::process::ExitStatus::default(),
+                        source_pipe_stderr: format!("Failed to spawn source: {e}").into(),
+                        ffmpeg_pipe_stderr: None,
+                        stderr:             String::new().into(),
+                        stdout:             String::new().into(),
+                    })?
+            } else {
+                unreachable!()
+            };
 
-                let source_stdout = source.stdout.take().unwrap();
+            let source_stdout = source.stdout.take().expect("source stdout should exist");
 
-                let mut source_pipe = if let [ffmpeg, args @ ..] = &*cmd.0 {
-                    std::process::Command::new(ffmpeg)
+            let (mut source_pipe, mut enc_pipe) = {
+                if let Some(ff_cmd) = ff_cmd.as_deref() {
+                    let (ffmpeg, args) = ff_cmd.split_first().expect("not empty");
+                    let mut source_pipe = std::process::Command::new(ffmpeg)
                         .args(args)
                         .stdin(source_stdout)
                         .stdout(std::process::Stdio::piped())
@@ -527,99 +596,93 @@ impl TargetQuality {
                             ffmpeg_pipe_stderr: None,
                             stderr:             String::new().into(),
                             stdout:             String::new().into(),
-                        })?
+                        })?;
+
+                    let source_pipe_stdout =
+                        source_pipe.stdout.take().expect("source_pipe stdout should exist");
+
+                    let enc_pipe = if let [cmd, args @ ..] = &*output {
+                        build_encoder_pipe(cmd, args, source_pipe_stdout)?
+                    } else {
+                        unreachable!()
+                    };
+                    (Some(source_pipe), enc_pipe)
                 } else {
-                    unreachable!()
-                };
+                    // We unfortunately have to duplicate the code like this
+                    // in order to satisfy the borrow checker for `source_stdout`
+                    let enc_pipe = if let [cmd, args @ ..] = &*output {
+                        build_encoder_pipe(cmd, args, source_stdout)?
+                    } else {
+                        unreachable!()
+                    };
+                    (None, enc_pipe)
+                }
+            };
 
-                let source_pipe_stdout = source_pipe.stdout.take().unwrap();
+            // Drop stdout to prevent buffer deadlock
+            drop(enc_pipe.stdout.take());
 
-                let mut enc_pipe = if let [cmd, args @ ..] = &*cmd.1 {
-                    std::process::Command::new(cmd.as_ref())
-                        .args(args.iter().map(AsRef::as_ref))
-                        .stdin(source_pipe_stdout)
-                        .stdout(std::process::Stdio::piped())
-                        .stderr(std::process::Stdio::piped())
-                        .spawn()
-                        .map_err(|e| EncoderCrash {
-                            exit_status:        std::process::ExitStatus::default(),
-                            source_pipe_stderr: String::new().into(),
-                            ffmpeg_pipe_stderr: None,
-                            stderr:             format!("Failed to spawn encoder: {e}").into(),
-                            stdout:             String::new().into(),
-                        })?
-                } else {
-                    unreachable!()
-                };
+            let source_stderr = source.stderr.take().expect("source stderr should exist");
+            let stderr_thread1 = scope.spawn(move || {
+                let mut buf = Vec::new();
+                let mut stderr = source_stderr;
+                stderr.read_to_end(&mut buf).ok();
+                buf
+            });
 
-                // Drop stdout to prevent buffer deadlock
-                drop(enc_pipe.stdout.take());
-
-                // Start reading stderr concurrently to prevent deadlock
-                use std::{io::Read, thread};
-
-                let source_stderr = source.stderr.take().unwrap();
-                let source_pipe_stderr = source_pipe.stderr.take().unwrap();
-                let enc_stderr = enc_pipe.stderr.take().unwrap();
-
-                let stderr_thread1 = thread::spawn(move || {
-                    let mut buf = Vec::new();
-                    let mut stderr = source_stderr;
-                    stderr.read_to_end(&mut buf).ok();
-                    buf
-                });
-
-                let stderr_thread2 = thread::spawn(move || {
+            let source_pipe_stderr = source_pipe
+                .as_mut()
+                .map(|p| p.stderr.take().expect("source_pipe stderr should exist"));
+            let stderr_thread2 = source_pipe_stderr.map(|source_pipe_stderr| {
+                scope.spawn(move || {
                     let mut buf = Vec::new();
                     let mut stderr = source_pipe_stderr;
                     stderr.read_to_end(&mut buf).ok();
                     buf
-                });
+                })
+            });
 
-                let stderr_thread3 = thread::spawn(move || {
-                    let mut buf = Vec::new();
-                    let mut stderr = enc_stderr;
-                    stderr.read_to_end(&mut buf).ok();
-                    buf
-                });
+            let enc_pipe_stderr = enc_pipe.stderr.take().expect("enc_pipe stderr should exist");
+            let stderr_thread3 = scope.spawn(move || {
+                let mut buf = Vec::new();
+                let mut stderr = enc_pipe_stderr;
+                stderr.read_to_end(&mut buf).ok();
+                buf
+            });
 
-                // Wait for encoder & other processes to finish
-                let enc_status = enc_pipe.wait().map_err(|e| EncoderCrash {
-                    exit_status:        std::process::ExitStatus::default(),
-                    source_pipe_stderr: String::new().into(),
-                    ffmpeg_pipe_stderr: None,
-                    stderr:             format!("Failed to wait for encoder: {e}").into(),
-                    stdout:             String::new().into(),
-                })?;
+            // Wait for encoder & other processes to finish
+            let enc_status = enc_pipe.wait().map_err(|e| EncoderCrash {
+                exit_status:        std::process::ExitStatus::default(),
+                source_pipe_stderr: String::new().into(),
+                ffmpeg_pipe_stderr: None,
+                stderr:             format!("Failed to wait for encoder: {e}").into(),
+                stdout:             String::new().into(),
+            })?;
 
+            if let Some(source_pipe) = source_pipe.as_mut() {
                 let _ = source_pipe.wait();
-                let _ = source.wait();
+            };
+            let _ = source.wait();
 
-                // Collect stderr after process finishes
-                let stderr_handles = (
-                    stderr_thread1.join().unwrap_or_default(),
-                    stderr_thread2.join().unwrap_or_default(),
-                    stderr_thread3.join().unwrap_or_default(),
-                );
+            // Collect stderr after process finishes
+            let stderr_handles = (
+                stderr_thread1.join().unwrap_or_default(),
+                stderr_thread2.map(|t| t.join().unwrap_or_default()),
+                stderr_thread3.join().unwrap_or_default(),
+            );
 
-                if !enc_status.success() {
-                    return Err(EncoderCrash {
-                        exit_status:        enc_status,
-                        source_pipe_stderr: stderr_handles.0.into(),
-                        ffmpeg_pipe_stderr: Some(stderr_handles.1.into()),
-                        stderr:             stderr_handles.2.into(),
-                        stdout:             String::new().into(),
-                    });
-                }
+            if !enc_status.success() {
+                return Err(EncoderCrash {
+                    exit_status:        enc_status,
+                    source_pipe_stderr: stderr_handles.0.into(),
+                    ffmpeg_pipe_stderr: stderr_handles.1.map(|h| h.into()),
+                    stderr:             stderr_handles.2.into(),
+                    stdout:             String::new().into(),
+                });
+            }
 
-                Ok(())
-            })
-            .await
-            .unwrap()
-        };
-
-        let rt = tokio::runtime::Builder::new_current_thread().enable_io().build().unwrap();
-        rt.block_on(future)?;
+            Ok(())
+        })?;
 
         let extension = match self.encoder {
             crate::encoder::Encoder::x264 => "264",
@@ -627,77 +690,325 @@ impl TargetQuality {
             _ => "ivf",
         };
 
-        let probe_name = std::path::Path::new(&chunk.temp)
-            .join("split")
-            .join(format!("v_{index:05}_{q}.{extension}", index = chunk.index));
+        let q_str = crate::encoder::format_q(q);
+        let probe_name = format!("v_{index:05}_{q_str}.{extension}", index = chunk.index);
 
-        Ok(probe_name)
+        Ok(std::path::Path::new(&chunk.temp).join("split").join(&probe_name))
     }
 
     #[inline]
-    pub fn per_shot_target_quality_routine(
-        &self,
-        chunk: &mut Chunk,
-        worker_id: Option<usize>,
-    ) -> anyhow::Result<()> {
-        chunk.tq_cq = Some(self.per_shot_target_quality(chunk, worker_id)?);
-        Ok(())
+    pub fn parse_probing_statistic(stat: &str) -> anyhow::Result<ProbingStatistic> {
+        Ok(match stat.to_lowercase().as_str() {
+            "auto" => ProbingStatistic {
+                name:  ProbingStatisticName::Automatic,
+                value: None,
+            },
+            "mean" => ProbingStatistic {
+                name:  ProbingStatisticName::Mean,
+                value: None,
+            },
+            "harmonic" => ProbingStatistic {
+                name:  ProbingStatisticName::Harmonic,
+                value: None,
+            },
+            "root-mean-square" => ProbingStatistic {
+                name:  ProbingStatisticName::RootMeanSquare,
+                value: None,
+            },
+            "median" => ProbingStatistic {
+                name:  ProbingStatisticName::Median,
+                value: None,
+            },
+            "mode" => ProbingStatistic {
+                name:  ProbingStatisticName::Mode,
+                value: None,
+            },
+            "minimum" => ProbingStatistic {
+                name:  ProbingStatisticName::Minimum,
+                value: None,
+            },
+            "maximum" => ProbingStatistic {
+                name:  ProbingStatisticName::Maximum,
+                value: None,
+            },
+            probe_statistic if probe_statistic.starts_with("percentile") => {
+                if probe_statistic.matches('=').count() != 1
+                    || !probe_statistic.starts_with("percentile=")
+                {
+                    return Err(anyhow!(
+                        "Probing Statistic percentile must have a value between 0.0 and 100.0 set \
+                         using \"=\" (eg. \"--probing-stat percentile=1\")"
+                    ));
+                }
+                let value = probe_statistic
+                    .split("=")
+                    .last()
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .and_then(|v| (0.0..=100.0).contains(&v).then_some(v))
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "Probing Statistic percentile must be set to a value between 0 and 100"
+                        )
+                    })?;
+                ProbingStatistic {
+                    name:  ProbingStatisticName::Percentile,
+                    value: Some(value),
+                }
+            },
+            probe_statistic if probe_statistic.starts_with("standard-deviation") => {
+                if probe_statistic.matches('=').count() != 1
+                    || !probe_statistic.starts_with("standard-deviation=")
+                {
+                    return Err(anyhow!(
+                        "Probing Statistic standard deviation must have a positive or negative \
+                         value set using \"=\" (eg. \"--probing-stat standard-deviation=-0.25\")"
+                    ));
+                }
+                let value = probe_statistic
+                    .split('=')
+                    .next_back()
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .ok_or_else(|| {
+                        anyhow!("Probing Statistic standard deviation must have a value appended")
+                    })?;
+                ProbingStatistic {
+                    name:  ProbingStatisticName::StandardDeviation,
+                    value: Some(value),
+                }
+            },
+            _ => {
+                return Err(anyhow!("Unknown Probing Statistic: {}", stat));
+            },
+        })
     }
+
+    #[inline]
+    pub fn parse_target_qp_range(s: &str) -> Result<(f64, f64), String> {
+        if let Some((min_str, max_str)) = s.split_once('-') {
+            let min = min_str.parse::<f64>().map_err(|_| "Invalid range format")?;
+            let max = max_str.parse::<f64>().map_err(|_| "Invalid range format")?;
+            if min >= max {
+                return Err("Min must be < max".to_string());
+            }
+            Ok((min, max))
+        } else {
+            let mut val = s.parse::<f64>().map_err(|_| "Invalid number")?;
+            // Convert 0 to 0.001 to avoid degenerate range issues
+            if val == 0.0 {
+                val = 0.001;
+            }
+            let tol = val * 0.01;
+            Ok((val - tol, val + tol))
+        }
+    }
+
+    #[inline]
+    pub fn parse_interp_method(
+        s: &str,
+    ) -> anyhow::Result<(InterpolationMethod, InterpolationMethod)> {
+        let parts: Vec<&str> = s.split('-').collect();
+        if parts.len() != 2 {
+            return Err(anyhow::anyhow!(
+                "Invalid format. Use: --interp-method method4-method5"
+            ));
+        }
+
+        let method4 = parts[0]
+            .parse::<InterpolationMethod>()
+            .map_err(|_| anyhow::anyhow!("Invalid 4th round method: {}", parts[0]))?;
+        let method5 = parts[1]
+            .parse::<InterpolationMethod>()
+            .map_err(|_| anyhow::anyhow!("Invalid 5th round method: {}", parts[1]))?;
+
+        // Validate methods for correct round
+        match method4 {
+            InterpolationMethod::Linear
+            | InterpolationMethod::Quadratic
+            | InterpolationMethod::Natural => {},
+            _ => {
+                return Err(anyhow::anyhow!(
+                    "Method '{}' not available for 4th round",
+                    parts[0]
+                ))
+            },
+        }
+
+        Ok((method4, method5))
+    }
+
+    #[inline]
+    pub fn parse_qp_range(s: &str) -> Result<(u32, u32), String> {
+        if let Some((min_str, max_str)) = s.split_once('-') {
+            let min = min_str.parse::<u32>().map_err(|_| "Invalid range format")?;
+            let max = max_str.parse::<u32>().map_err(|_| "Invalid range format")?;
+            if min >= max {
+                return Err("Min must be < max".to_string());
+            }
+            Ok((min, max))
+        } else {
+            Err("Quality range must be specified as min-max (e.g., 10-50)".to_string())
+        }
+    }
+
+    #[inline]
+    pub fn parse_probe_res(probe_resolution: &str) -> Result<(u32, u32), String> {
+        let parts: Vec<_> = probe_resolution.split('x').collect();
+        if parts.len() != 2 {
+            return Err(format!(
+                "Invalid probe resolution: {probe_resolution}. Expected widthxheight"
+            ));
+        }
+        let width = parts
+            .first()
+            .expect("Probe resolution has width and height")
+            .parse::<u32>()
+            .map_err(|_| format!("Invalid probe resolution width: {probe_resolution}"))?;
+        let height = parts
+            .get(1)
+            .expect("Probe resolution has width and height")
+            .parse::<u32>()
+            .map_err(|_| format!("Invalid probe resolution height: {probe_resolution}"))?;
+
+        Ok((width, height))
+    }
+
+    #[inline]
+    pub fn validate_probes(probes: u32) -> Result<(u32, Option<String>), String> {
+        match probes {
+            probes if probes >= 4 => Ok((probes, None)),
+            1..4 => Ok((
+                probes,
+                Some("Number of probes is recommended to be at least 4".to_string()),
+            )),
+            _ => Err("Number of probes must be greater than 0".to_string()),
+        }
+    }
+
+    #[inline]
+    pub fn validate_probing_rate(probing_rate: usize) -> Result<(usize, Option<String>), String> {
+        match probing_rate {
+            1..=4 => Ok((probing_rate, None)),
+            _ => Err("Probing rate must be an integer from 1 to 4".to_string()),
+        }
+    }
+}
+
+#[expect(clippy::result_large_err)]
+fn build_encoder_pipe(
+    cmd: &str,
+    args: &[Cow<'_, str>],
+    in_pipe: impl Into<Stdio>,
+) -> Result<Child, EncoderCrash> {
+    std::process::Command::new(cmd)
+        .args(args.iter().map(AsRef::as_ref))
+        .stdin(in_pipe)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| EncoderCrash {
+            exit_status:        std::process::ExitStatus::default(),
+            source_pipe_stderr: String::new().into(),
+            ffmpeg_pipe_stderr: None,
+            stderr:             format!("Failed to spawn encoder: {e}").into(),
+            stdout:             String::new().into(),
+        })
 }
 
 fn predict_quantizer(
-    lower_quantizer_limit: u32,
-    upper_quantizer_limit: u32,
-    quantizer_score_history: &[(u32, f64)],
-    target: f64,
-) -> u32 {
-    // The midpoint between the upper and lower quantizer bounds
-    let binary_search = (lower_quantizer_limit + upper_quantizer_limit) / 2;
-    if quantizer_score_history.len() < 2 {
-        // Fewer than 2 probes, predict using binary search
-        return binary_search;
-    }
+    lower_quantizer_limit: f32,
+    upper_quantizer_limit: f32,
+    quantizer_score_history: &[(f32, f64)],
+    target_range: (f64, f64),
+    interp_method: Option<(InterpolationMethod, InterpolationMethod)>,
+    step: f32,
+) -> anyhow::Result<f32> {
+    let target = f64::midpoint(target_range.0, target_range.1);
+    let binary_search = f32::midpoint(lower_quantizer_limit, upper_quantizer_limit);
 
-    // Sort history by quantizer
-    let mut sorted_quantizer_score_history = quantizer_score_history.to_vec();
-    sorted_quantizer_score_history.sort_by_key(|(quantizer, _)| *quantizer);
+    let predicted_quantizer = match quantizer_score_history.len() {
+        0..=1 => binary_search as f64,
+        n => {
+            // Sort history by quantizer
+            let mut sorted = quantizer_score_history.to_vec();
+            sorted.sort_by(|(_, s1), (_, s2)| {
+                s1.partial_cmp(s2).unwrap_or(std::cmp::Ordering::Equal)
+            });
 
-    let keys = sorted_quantizer_score_history
-        .iter()
-        .map(|(quantizer, score)| {
-            Key::new(
-                *score,
-                *quantizer as f64,
-                match sorted_quantizer_score_history.len() {
-                    0..=1 => unreachable!(),        // Handled in earlier guard
-                    2 => Interpolation::Linear,     // 2 probes, use Linear without fitting curve
-                    _ => Interpolation::CatmullRom, // 3 or more probes, fit CatmullRom curve
+            let (scores, quantizers): (Vec<f64>, Vec<f64>) =
+                sorted.iter().map(|(q, s)| (*s, *q as f64)).unzip();
+
+            let result = match n {
+                2 => {
+                    // 3rd probe: linear interpolation
+                    linear_interpolate(
+                        &[scores[0], scores[1]],
+                        &[quantizers[0], quantizers[1]],
+                        target,
+                    )
                 },
-            )
-        })
-        .collect::<Vec<_>>();
+                3 => {
+                    // 4th probe: configurable method
+                    let method = interp_method.map_or(InterpolationMethod::Natural, |(m, _)| m);
+                    match method {
+                        InterpolationMethod::Linear => linear_interpolate(
+                            &[scores[0], scores[1]],
+                            &[quantizers[0], quantizers[1]],
+                            target,
+                        ),
+                        InterpolationMethod::Quadratic => quadratic_interpolate(
+                            &[scores[0], scores[1], scores[2]],
+                            &[quantizers[0], quantizers[1], quantizers[2]],
+                            target,
+                        ),
+                        InterpolationMethod::Natural => {
+                            natural_cubic_spline(&scores, &quantizers, target)
+                        },
+                        _ => None,
+                    }
+                },
+                4 => {
+                    // 5th probe: configurable method
+                    let method = interp_method.map_or(InterpolationMethod::Pchip, |(_, m)| m);
+                    let s: &[f64; 4] = &scores[..4].try_into()?;
+                    let q: &[f64; 4] = &quantizers[..4].try_into()?;
 
-    let spline = Spline::from_vec(keys);
-    let predicted_quantizer = spline.sample(target).unwrap_or_else(|| {
-        // Probes do not fit Catmull-Rom curve, fallback to Linear
-        trace!("Probes do not fit Catmull-Rom curve, falling back to Linear");
-        let keys = sorted_quantizer_score_history
-            .iter()
-            .map(|(quantizer, score)| Key::new(*score, *quantizer as f64, Interpolation::Linear))
-            .collect();
-        Spline::from_vec(keys).sample(target).unwrap_or_else(|| {
-            // Probes do not fit Catmull-Rom curve or Linear, fallback to binary search
-            trace!("Probes do not fit Linear curve, falling back to binary search");
-            binary_search as f64
-        })
-    });
+                    match method {
+                        InterpolationMethod::Linear => {
+                            linear_interpolate(&[s[0], s[1]], &[q[0], q[1]], target)
+                        },
+                        InterpolationMethod::Quadratic => {
+                            quadratic_interpolate(&[s[0], s[1], s[2]], &[q[0], q[1], q[2]], target)
+                        },
+                        InterpolationMethod::Natural => {
+                            natural_cubic_spline(&scores, &quantizers, target)
+                        },
+                        InterpolationMethod::Pchip => pchip_interpolate(s, q, target),
+                        InterpolationMethod::Catmull => catmull_rom_interpolate(s, q, target),
+                        InterpolationMethod::Akima => akima_interpolate(s, q, target),
+                        InterpolationMethod::CubicPolynomial => {
+                            cubic_polynomial_interpolate(s, q, target)
+                        },
+                    }
+                },
+                _ => None,
+            };
 
-    // Ensure predicted quantizer is an integer and within bounds
-    (predicted_quantizer.round() as u32).clamp(lower_quantizer_limit, upper_quantizer_limit)
+            result.unwrap_or_else(|| {
+                trace!("Interpolation failed, falling back to binary search");
+                binary_search as f64
+            })
+        },
+    };
+
+    // Round the result of the interpolation to the nearest integer
+    Ok(
+        (((predicted_quantizer / step as f64).round() * step as f64) as f32)
+            .clamp(lower_quantizer_limit, upper_quantizer_limit),
+    )
 }
 
-fn within_tolerance(score: f64, target: f64) -> bool {
-    (score - target).abs() / target < SCORE_TOLERANCE
+fn within_range(score: f64, target_range: (f64, f64)) -> bool {
+    score >= target_range.0 && score <= target_range.1
 }
 
 pub fn vmaf_auto_threads(workers: usize) -> usize {
@@ -722,22 +1033,23 @@ pub enum SkipProbingReason {
     None,
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub fn log_probes(
-    quantizer_score_history: &[(u32, f64)],
+    quantizer_score_history: &[(f32, f64)],
     metric: TargetMetric,
-    target: f64,
+    target: (f64, f64),
     frames: u32,
     probing_rate: u32,
-    probing_speed: Option<ProbingSpeed>,
+    video_params: Option<&Vec<String>>,
     chunk_name: &str,
-    target_quantizer: u32,
+    target_quantizer: f32,
     target_score: f64,
     skip: SkipProbingReason,
 ) {
     // Sort history by quantizer
     let mut sorted_quantizer_scores = quantizer_score_history.to_vec();
-    sorted_quantizer_scores.sort_by_key(|(quantizer, _)| *quantizer);
+    sorted_quantizer_scores
+        .sort_by(|(q1, _), (q2, _)| q1.partial_cmp(q2).unwrap_or(std::cmp::Ordering::Equal));
     // Butteraugli is an inverse metric and needs to be inverted back before display
     if matches!(
         metric,
@@ -750,16 +1062,22 @@ pub fn log_probes(
     }
 
     debug!(
-        "chunk {name}: Target={target}, Metric={target_metric}, P-Rate={rate}, P-Speed={speed:?}, \
-         {frame_count} frames
-        TQ-Probes: {history:.2?}{suffix}
-        Final Q={target_quantizer:.0}, Final Score={target_score:.2}",
+        "chunk {name}: Target={min}-{max}, Metric={target_metric}, P-Rate={rate}, {frame_count} \
+         frames{custom_params_string}
+       TQ-Probes: {history:.2?}{suffix}
+       Final Q={target_quantizer:.2}, Final Score={target_score:.2}",
         name = chunk_name,
-        target = target,
+        min = target.0,
+        max = target.1,
         target_metric = metric,
         rate = probing_rate,
-        speed = probing_speed.unwrap_or(ProbingSpeed::VeryFast),
         frame_count = frames,
+        custom_params_string = video_params
+            .map(|params| format!(
+                ", P-Video-Params: {params_string}",
+                params_string = params.join(" ")
+            ))
+            .unwrap_or_default(),
         history = sorted_quantizer_scores,
         suffix = match skip {
             SkipProbingReason::None => "",
@@ -771,4 +1089,97 @@ pub fn log_probes(
         target_quantizer = target_quantizer,
         target_score = target_score
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Full algorithm simulation tests
+    fn get_score_map(case: usize) -> Vec<(f32, f64)> {
+        match case {
+            1 => vec![(35.0, 80.08)],
+            2 => vec![(17.0, 80.03), (35.0, 65.73)],
+            3 => vec![(17.0, 83.15), (22.0, 80.02), (35.0, 71.94)],
+            4 => vec![(17.0, 85.81), (30.0, 80.92), (32.0, 80.01), (35.0, 78.05)],
+            5 => vec![(35.0, 83.31), (53.0, 81.22), (55.0, 80.03), (61.0, 73.56), (64.0, 67.56)],
+            6 => vec![
+                (35.0, 86.99),
+                (53.0, 84.41),
+                (57.0, 82.47),
+                (59.0, 81.14),
+                (60.0, 80.09),
+                (61.0, 78.58),
+                (69.0, 68.57),
+                (70.0, 64.90),
+            ],
+            _ => panic!("Unknown case"),
+        }
+    }
+
+    fn run_av1an_simulation(case: usize) -> Vec<(f32, f64)> {
+        let scores = get_score_map(case);
+        let mut history = vec![];
+        let mut lo = 1.0f32;
+        let mut hi = 70.0f32;
+        let target_range = (79.5, 80.5);
+
+        for _ in 1..=10 {
+            if lo > hi {
+                break;
+            }
+            let next_quantizer = predict_quantizer(lo, hi, &history, target_range, None, 1.0)
+                .expect("predict_quantizer should succeed");
+
+            // Round to nearest available quantizer in test data
+            let next_quantizer = if let Some((closest_q, _)) =
+                scores.iter().min_by(|(q1, _), (q2, _)| {
+                    ((*q1 - next_quantizer).abs())
+                        .partial_cmp(&((*q2 - next_quantizer).abs()))
+                        .expect("partial_cmp should succeed")
+                }) {
+                *closest_q
+            } else {
+                next_quantizer
+            };
+
+            // Check if this quantizer was already probed
+            if let Some((_quantizer, _score)) =
+                history.iter().find(|(quantizer, _)| *quantizer == next_quantizer)
+            {
+                break;
+            }
+
+            if let Some((_, score)) = scores.iter().find(|(q, _)| *q == next_quantizer) {
+                history.push((next_quantizer, *score));
+
+                if within_range(*score, target_range) {
+                    break;
+                }
+
+                if *score > target_range.1 {
+                    lo = (next_quantizer + 1.0).min(hi);
+                } else if *score < target_range.0 {
+                    hi = (next_quantizer - 1.0).max(lo);
+                }
+            } else {
+                break;
+            }
+        }
+
+        history
+    }
+
+    #[test]
+    fn target_quality_all_cases() {
+        for case in 1..=6 {
+            let result = run_av1an_simulation(case);
+            assert!(!result.is_empty(), "Case {} returned empty result", case);
+            assert!(
+                within_range(result.last().expect("result is not empty").1, (79.5, 80.5)),
+                "Case {} final score not in range",
+                case
+            );
+        }
+    }
 }
